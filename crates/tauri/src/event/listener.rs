@@ -11,7 +11,7 @@ use std::{
   cell::Cell,
   collections::{HashMap, HashSet},
   sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicU32, Ordering},
   },
 };
@@ -26,6 +26,42 @@ enum Pending {
   },
   Emit(EmitArgs),
   RemoveForTarget(EventTarget),
+}
+
+impl Pending {
+  fn apply(self, handlers: &mut Handlers) {
+    match self {
+      Pending::Unlisten(id) => handlers.values_mut().for_each(|handlers| {
+        handlers.remove(&id);
+      }),
+      Pending::Listen { id, event, handler } => {
+        handlers.entry(event).or_default().insert(id, handler);
+      }
+      Pending::Emit(emit_args) => {
+        dispatch(handlers, &emit_args, &None::<&dyn Fn(&EventTarget) -> bool>)
+      }
+      Pending::RemoveForTarget(target) => {
+        for handlers in handlers.values_mut() {
+          handlers.retain(|_, handler| handler.target != target);
+        }
+        handlers.retain(|_, handlers| !handlers.is_empty());
+      }
+    }
+  }
+}
+
+fn dispatch<F: Fn(&EventTarget) -> bool>(
+  handlers: &Handlers,
+  emit_args: &EmitArgs,
+  filter: &Option<F>,
+) {
+  if let Some(handlers) = handlers.get(&emit_args.event) {
+    for (&id, Handler { target, callback }) in handlers {
+      if match_any_or_filter(target, filter) {
+        callback(Event::new(id, emit_args.payload.clone()))
+      }
+    }
+  }
 }
 
 /// Stored in [`Listeners`] to be called upon, when the event that stored it, is triggered.
@@ -57,10 +93,12 @@ impl JsHandler {
 
 type WebviewLabel = String;
 
+type Handlers = HashMap<crate::EventName, HashMap<EventId, Handler>>;
+
 /// Holds event handlers and pending event handlers, along with the salts associating them.
 struct InnerListeners {
   pending: Mutex<Vec<Pending>>,
-  handlers: Mutex<HashMap<crate::EventName, HashMap<EventId, Handler>>>,
+  handlers: Mutex<Handlers>,
   js_event_listeners: Mutex<HashMap<WebviewLabel, HashMap<crate::EventName, HashSet<JsHandler>>>>,
   function_name: &'static str,
   listeners_object_name: &'static str,
@@ -103,44 +141,59 @@ impl Listeners {
     self.inner.listeners_object_name
   }
 
-  /// Insert a pending event action to the queue.
-  fn insert_pending(&self, action: Pending) {
+  fn pending(&self) -> MutexGuard<'_, Vec<Pending>> {
     self
       .inner
       .pending
       .lock()
       .expect("poisoned pending event queue")
-      .push(action)
   }
 
-  /// Finish all pending event actions.
-  fn flush_pending(&self) -> crate::Result<()> {
-    let pending = {
-      let mut lock = self
-        .inner
-        .pending
-        .lock()
-        .expect("poisoned pending event queue");
-      std::mem::take(&mut *lock)
-    };
-
-    for action in pending {
-      match action {
-        Pending::Unlisten(id) => self.unlisten(id),
-        Pending::Listen { id, event, handler } => self.listen_with_id(id, event, handler),
-        Pending::Emit(args) => self.emit(args)?,
-        Pending::RemoveForTarget(target) => self.remove_listeners_for_target(target),
+  /// Runs `action` on the handlers, or queues it while another call holds them.
+  ///
+  /// Handlers run with the handlers lock held, so calls made from a handler, or from another
+  /// thread during a dispatch, are queued. Whoever holds the lock applies the queue before
+  /// releasing it and checks it again afterwards, and whoever queues tries to apply it, so a
+  /// queued action always has someone to apply it.
+  fn run_or_queue<T>(
+    &self,
+    action: T,
+    run: impl FnOnce(&mut Handlers, T),
+    queued: impl FnOnce(T) -> Pending,
+  ) {
+    match self.inner.handlers.try_lock() {
+      Ok(mut handlers) => {
+        self.apply_pending(&mut handlers);
+        run(&mut handlers, action);
+        self.apply_pending(&mut handlers);
       }
+      Err(_) => self.pending().push(queued(action)),
     }
 
-    Ok(())
+    while !self.pending().is_empty() {
+      let Ok(mut handlers) = self.inner.handlers.try_lock() else {
+        return;
+      };
+      self.apply_pending(&mut handlers);
+    }
   }
 
-  fn listen_with_id(&self, id: EventId, event: crate::EventName, handler: Handler) {
-    match self.inner.handlers.try_lock() {
-      Err(_) => self.insert_pending(Pending::Listen { id, event, handler }),
-      Ok(mut lock) => {
-        lock.entry(event).or_default().insert(id, handler);
+  fn run(&self, action: Pending) {
+    self.run_or_queue(
+      action,
+      |handlers, action| action.apply(handlers),
+      |action| action,
+    );
+  }
+
+  fn apply_pending(&self, handlers: &mut Handlers) {
+    loop {
+      let pending = std::mem::take(&mut *self.pending());
+      if pending.is_empty() {
+        return;
+      }
+      for action in pending {
+        action.apply(handlers);
       }
     }
   }
@@ -154,7 +207,7 @@ impl Listeners {
   ) -> EventId {
     let id = self.next_event_id();
     let handler = Handler::new(target, handler);
-    self.listen_with_id(id, event, handler);
+    self.run(Pending::Listen { id, event, handler });
     id
   }
 
@@ -180,12 +233,7 @@ impl Listeners {
 
   /// Removes an event listener.
   pub(crate) fn unlisten(&self, id: EventId) {
-    match self.inner.handlers.try_lock() {
-      Err(_) => self.insert_pending(Pending::Unlisten(id)),
-      Ok(mut lock) => lock.values_mut().for_each(|handler| {
-        handler.remove(&id);
-      }),
-    }
+    self.run(Pending::Unlisten(id));
   }
 
   /// Removes every Rust-side event listener registered for the exact given target.
@@ -193,15 +241,7 @@ impl Listeners {
   /// Called when a window or webview is destroyed so its listeners don't leak.
   /// Global targets such as [`EventTarget::App`], [`EventTarget::Any`] and [`EventTarget::AnyLabel`] are never matched here.
   fn remove_listeners_for_target(&self, target: EventTarget) {
-    match self.inner.handlers.try_lock() {
-      Err(_) => self.insert_pending(Pending::RemoveForTarget(target)),
-      Ok(mut lock) => {
-        for handlers in lock.values_mut() {
-          handlers.retain(|_, handler| handler.target != target);
-        }
-        lock.retain(|_, handlers| !handlers.is_empty());
-      }
-    }
+    self.run(Pending::RemoveForTarget(target));
   }
 
   /// Emits the given event with its payload based on a filter.
@@ -209,26 +249,11 @@ impl Listeners {
   where
     F: Fn(&EventTarget) -> bool,
   {
-    let mut maybe_pending = false;
-
-    match self.inner.handlers.try_lock() {
-      Err(_) => self.insert_pending(Pending::Emit(emit_args)),
-      Ok(lock) => {
-        if let Some(handlers) = lock.get(&emit_args.event) {
-          let handlers = handlers.iter();
-          let handlers = handlers.filter(|(_, h)| match_any_or_filter(&h.target, &filter));
-          for (&id, Handler { callback, .. }) in handlers {
-            maybe_pending = true;
-            (callback)(Event::new(id, emit_args.payload.clone()))
-          }
-        }
-      }
-    }
-
-    if maybe_pending {
-      self.flush_pending()?;
-    }
-
+    self.run_or_queue(
+      emit_args,
+      |handlers, emit_args| dispatch(handlers, &emit_args, &filter),
+      Pending::Emit,
+    );
     Ok(())
   }
 
@@ -484,6 +509,53 @@ mod test {
       .unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+  }
+
+  #[test]
+  fn emit_queued_during_another_threads_dispatch_is_delivered() {
+    use std::sync::mpsc;
+
+    let listeners = Listeners::default();
+    let filtered = crate::EventName::new("filtered".to_owned()).unwrap();
+    let reply = crate::EventName::new("reply".to_owned()).unwrap();
+
+    listeners.listen(filtered.clone(), EventTarget::App, event_fn);
+    let delivered = Arc::new(AtomicU32::new(0));
+    let delivered_clone = delivered.clone();
+    listeners.listen(reply.clone(), EventTarget::Any, move |_| {
+      delivered_clone.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let dispatcher = {
+      let listeners = listeners.clone();
+      std::thread::spawn(move || {
+        // The filter runs while the dispatching thread holds the handlers lock,
+        // and rejects the only handler, so this dispatch calls no handler.
+        let filter = |_: &EventTarget| {
+          entered_tx.send(()).unwrap();
+          release_rx.recv().unwrap();
+          false
+        };
+        listeners
+          .emit_filter(
+            EmitArgs::new(filtered.as_str_event(), &()).unwrap(),
+            Some(filter),
+          )
+          .unwrap();
+      })
+    };
+
+    entered_rx.recv().unwrap();
+    // The handlers are locked by the dispatcher, so this emit is queued.
+    listeners
+      .emit(EmitArgs::new(reply.as_str_event(), &()).unwrap())
+      .unwrap();
+    release_tx.send(()).unwrap();
+    dispatcher.join().unwrap();
+
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
   }
 
   #[test]
